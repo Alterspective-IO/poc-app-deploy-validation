@@ -1,9 +1,40 @@
-import express from "express";
-import { createClient } from "@supabase/supabase-js";
+import express, { Request, Response, NextFunction } from "express";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
+
+// ── Environment validation (ENVIRONMENT-STANDARDS) ──
+
+const REQUIRED_ENV: Record<string, string> = {};
+const OPTIONAL_ENV: Record<string, string> = {
+  PORT: "3000",
+  APP_ENV: "local",
+  SUPABASE_URL: "",
+  SUPABASE_ANON_KEY: "",
+  AZURE_SIGNALR_CONNECTION_STRING: "",
+  KEYSTONE_URL: "",
+  KEYSTONE_SERVICE_TOKEN: "",
+  HANDOFF_TOKEN_SECRET: "",
+};
+
+function validateEnv(): string[] {
+  const warnings: string[] = [];
+  for (const [key] of Object.entries(REQUIRED_ENV)) {
+    if (!process.env[key]) {
+      warnings.push(`REQUIRED env var ${key} is not set`);
+    }
+  }
+  for (const [key, fallback] of Object.entries(OPTIONAL_ENV)) {
+    if (!process.env[key] && fallback) {
+      process.env[key] = fallback;
+    }
+  }
+  return warnings;
+}
+
+const envWarnings = validateEnv();
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
@@ -12,6 +43,35 @@ const VERSION = process.env.APP_VERSION || process.env.npm_package_version || re
 const BUILD_SHA = process.env.APP_BUILD_SHA || process.env.SOURCE_COMMIT?.slice(0, 7) || "local";
 const BUILD_DATE = process.env.APP_BUILD_DATE || new Date().toISOString();
 const REPO_URL = "https://github.com/Alterspective-IO/poc-app-deploy-validation";
+
+// ── Structured logging (LOGGING-STANDARDS) ──
+
+function log(level: "info" | "warn" | "error", message: string, meta?: Record<string, unknown>) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    level,
+    service: "deploy-poc",
+    component: "api",
+    message,
+    environment: RAW_ENV,
+    version: VERSION,
+    ...meta,
+  };
+  process.stdout.write(JSON.stringify(entry) + "\n");
+}
+
+// ── Security middleware (SECURITY-STANDARDS) ──
+
+// Security headers (helmet equivalent — minimal for POC without adding dependency)
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-XSS-Protection", "0");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.removeHeader("X-Powered-By");
+  next();
+});
 
 // ── VER-UI-07: Canonical environment display labels ──
 
@@ -30,7 +90,6 @@ function getDisplayVersion(): string {
   if (RAW_ENV === "local" || RAW_ENV === "dev" || RAW_ENV === "development") {
     return `${VERSION}-dev+sha.${BUILD_SHA}`;
   }
-  // Staging / UAT / test — pre-release identifier
   return `${VERSION}-rc+sha.${BUILD_SHA}`;
 }
 
@@ -49,14 +108,20 @@ function readChangelog(): string {
   }
 }
 
-// ── Service clients ──
+// ── Supabase client — singleton (SUPABASE-STANDARDS: one client instance) ──
 
-function getSupabaseClient() {
+let supabaseClient: SupabaseClient | null = null;
+
+function getSupabaseClient(): SupabaseClient | null {
+  if (supabaseClient) return supabaseClient;
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_ANON_KEY;
   if (!url || !key) return null;
-  return createClient(url, key);
+  supabaseClient = createClient(url, key);
+  return supabaseClient;
 }
+
+// ── SignalR connection string parser (REALTIME-STANDARDS) ──
 
 function parseSignalRConnectionString(cs: string) {
   const pairs = cs.split(";").reduce<Record<string, string>>((acc, pair) => {
@@ -65,6 +130,18 @@ function parseSignalRConnectionString(cs: string) {
     return acc;
   }, {});
   return { endpoint: pairs.Endpoint, accessKey: pairs.AccessKey, version: pairs.Version };
+}
+
+// ── Nonce store for Keystone auth (KEYSTONE-DOWNSTREAM-INTEGRATION-STANDARDS) ──
+
+const nonceStore = new Map<string, { createdAt: number; returnTo: string }>();
+const NONCE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+function cleanExpiredNonces() {
+  const now = Date.now();
+  for (const [nonce, data] of nonceStore) {
+    if (now - data.createdAt > NONCE_TTL_MS) nonceStore.delete(nonce);
+  }
 }
 
 // ── Health checks ──
@@ -81,8 +158,8 @@ async function checkSupabase(): Promise<CheckResult> {
     }
     if (error) return { status: "ok", detail: `Connected (query note: ${error.message})` };
     return { status: "ok", detail: "Connected and queried successfully" };
-  } catch (e: any) {
-    return { status: "fail", detail: e.message };
+  } catch (e: unknown) {
+    return { status: "fail", detail: e instanceof Error ? e.message : "Unknown error" };
   }
 }
 
@@ -96,7 +173,8 @@ async function checkSignalR(): Promise<CheckResult> {
     const res = await fetch(url, { method: "GET", signal: AbortSignal.timeout(5000) });
     return { status: res.ok ? "ok" : "warn", detail: `${config.endpoint} responded ${res.status}` };
   } catch {
-    const cs = process.env.AZURE_SIGNALR_CONNECTION_STRING!;
+    const cs = process.env.AZURE_SIGNALR_CONNECTION_STRING;
+    if (!cs) return { status: "fail", detail: "Connection string not set" };
     const config = parseSignalRConnectionString(cs);
     if (config.endpoint && config.accessKey) {
       return { status: "ok", detail: `Connection string valid (endpoint: ${config.endpoint})` };
@@ -111,8 +189,8 @@ async function checkKeystone(): Promise<CheckResult> {
     if (!url) return { status: "skip", detail: "KEYSTONE_URL not set" };
     const res = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(5000) });
     return { status: res.ok ? "ok" : "fail", detail: `${url} responded ${res.status}` };
-  } catch (e: any) {
-    return { status: "fail", detail: e.message };
+  } catch (e: unknown) {
+    return { status: "fail", detail: e instanceof Error ? e.message : "Unknown error" };
   }
 }
 
@@ -171,7 +249,6 @@ app.get("/api/version", (_req, res) => {
 app.get("/changelog", (_req, res) => {
   const raw = readChangelog();
 
-  // Simple markdown-to-HTML: headers, lists, links
   const html = raw
     .replace(/^### (.+)$/gm, '<h3>$1</h3>')
     .replace(/^## (.+)$/gm, '<h2>$1</h2>')
@@ -212,33 +289,75 @@ app.get("/changelog", (_req, res) => {
 </html>`);
 });
 
-// Auth: login redirect to Keystone
+// Auth: login redirect to Keystone (KEYSTONE-DOWNSTREAM-INTEGRATION-STANDARDS)
 app.get("/auth/login", (req, res) => {
   const keystoneUrl = process.env.KEYSTONE_URL;
   if (!keystoneUrl) {
-    res.status(500).json({ error: "KEYSTONE_URL not configured" });
+    res.status(503).json({ error: "Identity service not configured" });
     return;
   }
   const returnTo = (req.query.returnTo as string) || "/";
+  // Validate returnTo is a relative path (KEYSTONE: no absolute external URLs)
+  if (returnTo.startsWith("http") || returnTo.startsWith("//")) {
+    res.status(400).json({ error: "returnTo must be a relative path" });
+    return;
+  }
   const nonce = crypto.randomBytes(16).toString("hex");
+  // Store nonce for verification on callback (KEYSTONE: nonce MUST be stored)
+  cleanExpiredNonces();
+  nonceStore.set(nonce, { createdAt: Date.now(), returnTo });
+  log("info", "Keystone login initiated", { returnTo, noncePrefix: nonce.slice(0, 8) });
   res.redirect(
     `${keystoneUrl}/api/auth/login?app=deploy-poc&returnTo=${encodeURIComponent(returnTo)}&nonce=${nonce}`
   );
 });
 
-// Auth: callback from Keystone
+// Auth: callback from Keystone (KEYSTONE-DOWNSTREAM-INTEGRATION-STANDARDS)
 app.get("/auth/callback", (req, res) => {
   const handoff = req.query.handoff as string;
   const secret = process.env.HANDOFF_TOKEN_SECRET;
+
+  // Fail closed on missing inputs (KEYSTONE: fail closed)
   if (!handoff || !secret) {
-    res.status(400).json({ error: "Missing handoff token or secret" });
+    log("warn", "Auth callback missing handoff or secret");
+    res.status(400).json({ error: "Authentication failed" });
     return;
   }
+
   try {
-    const decoded = jwt.verify(handoff, secret, { algorithms: ["HS256"] });
-    res.json({ status: "authenticated", user: decoded });
-  } catch (e: any) {
-    res.status(401).json({ error: "Invalid handoff token", detail: e.message });
+    const decoded = jwt.verify(handoff, secret, { algorithms: ["HS256"] }) as jwt.JwtPayload;
+
+    // Verify required claims (KEYSTONE: verify iss, aud, exp, nonce)
+    if (decoded.aud !== "deploy-poc") {
+      log("warn", "Handoff token audience mismatch", { aud: decoded.aud });
+      res.status(401).json({ error: "Authentication failed" });
+      return;
+    }
+
+    if (decoded.nonce && !nonceStore.has(decoded.nonce as string)) {
+      log("warn", "Handoff token nonce mismatch or expired");
+      res.status(401).json({ error: "Authentication failed" });
+      return;
+    }
+
+    // Consume nonce (one-time use)
+    if (decoded.nonce) nonceStore.delete(decoded.nonce as string);
+
+    // Never return the raw decoded token to the client (SECURITY: no leaked internals)
+    log("info", "Keystone auth successful", { sub: decoded.sub, email: decoded.email });
+    res.json({
+      status: "authenticated",
+      user: {
+        sub: decoded.sub,
+        email: decoded.email,
+        displayName: decoded.display_name,
+        roles: decoded.roles,
+      },
+    });
+  } catch {
+    // Fail closed — generic error, no detail leak (ERROR-HANDLING / SECURITY)
+    log("warn", "Handoff token verification failed");
+    res.status(401).json({ error: "Authentication failed" });
   }
 });
 
@@ -280,8 +399,6 @@ app.get("/", async (_req, res) => {
     .status { font-size: 18px; }
     .meta { color: #64748b; font-size: 13px; margin-top: 4px; }
     a { color: #38bdf8; }
-
-    /* VER-UI-06: Runtime status cluster */
     .status-cluster {
       display: flex; align-items: center; gap: 12px;
       background: #1e293b; border-radius: 8px; padding: 10px 16px; margin: 12px 0;
@@ -292,7 +409,6 @@ app.get("/", async (_req, res) => {
       background: ${RAW_ENV === "production" || RAW_ENV === "prod" ? "#1e3a5f" : "#422006"};
       color: ${RAW_ENV === "production" || RAW_ENV === "prod" ? "#38bdf8" : "#f59e0b"};
     }
-    /* VER-UI-09: Severity indicator */
     .severity-dot {
       width: 10px; height: 10px; border-radius: 50%;
       background: ${severityColor[severity]};
@@ -308,12 +424,10 @@ app.get("/", async (_req, res) => {
   <h1>Deploy Validation POC</h1>
   <p>Proving the <a href="https://github.com/Alterspective-IO/Alterspective-Intelligence/blob/main/Practice/AI/runbooks/AIRUN-021-Coolify-Deployment-Playbook.md">AIRUN-021 Coolify Deployment Playbook</a>.</p>
 
-  <!-- VER-UI-06: Environment + version + severity status cluster -->
   <div class="status-cluster">
     <span class="env-badge">${ENV_LABEL}</span>
     <span class="severity-dot" title="${severityText[severity]}"></span>
     <span class="severity-text">${severityText[severity]}</span>
-    <!-- VER-UI-02: Version links to release history -->
     <a href="/changelog" class="version-link">v${DISPLAY_VERSION}</a>
   </div>
   <div class="build-meta" style="text-align:center; margin-bottom: 12px;">
@@ -353,8 +467,19 @@ app.get("/", async (_req, res) => {
 </html>`);
 });
 
+// ── Global error handler (ERROR-HANDLING-STANDARDS) ──
+
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  log("error", "Unhandled error", { error: err.message, stack: err.stack });
+  // Never leak internals to client (ERROR-HANDLING-STANDARDS)
+  res.status(500).json({ error: "Internal server error" });
+});
+
 // ── Start ──
 
 app.listen(PORT, () => {
-  console.log(`[deploy-poc] ${DISPLAY_VERSION} (${ENV_LABEL}) listening on :${PORT}`);
+  log("info", "Server started", { port: PORT, version: DISPLAY_VERSION, env: ENV_LABEL });
+  if (envWarnings.length > 0) {
+    for (const w of envWarnings) log("warn", w);
+  }
 });
