@@ -5,6 +5,29 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-18
+
+### Added
+- Structured JSON logging replacing console.log (LOGGING-STANDARDS)
+- Security headers middleware: X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions-Policy (SECURITY-STANDARDS)
+- Global Express error handler that never leaks internals (ERROR-HANDLING-STANDARDS)
+- Environment variable validation at startup with warnings (ENVIRONMENT-STANDARDS)
+- Nonce store with TTL for Keystone auth flow — nonces are stored on login and consumed on callback (KEYSTONE-DOWNSTREAM-INTEGRATION-STANDARDS)
+- Handoff JWT claim verification: aud, nonce matching (KEYSTONE-DOWNSTREAM-INTEGRATION-STANDARDS)
+- returnTo validation rejects absolute URLs (KEYSTONE-DOWNSTREAM-INTEGRATION-STANDARDS)
+- README.md with quick start, endpoints, and standards compliance reference (REPOSITORY-MANAGEMENT-STANDARDS)
+
+### Changed
+- Supabase client is now a singleton instead of created per request (SUPABASE-STANDARDS)
+- Auth callback returns safe user subset instead of full decoded JWT (SECURITY-STANDARDS)
+- Error responses use generic messages, never expose internal details (ERROR-HANDLING-STANDARDS)
+- Catch blocks use `unknown` type instead of `any` (CODING-STANDARDS)
+
+### Security
+- Auth callback fails closed on all verification errors (KEYSTONE-DOWNSTREAM-INTEGRATION-STANDARDS)
+- Raw handoff tokens are never logged (SECURITY-STANDARDS)
+- X-Powered-By header removed (SECURITY-STANDARDS)
+
 ## [0.2.0] - 2026-04-18
 
 ### Added
