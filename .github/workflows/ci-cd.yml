@@ -1,0 +1,200 @@
+# Template-Version: 1.0.0
+# Template-Name: ci-cd.yml
+# Last-Updated: 2026-04-18
+# DO NOT REMOVE THIS HEADER - Used for automated template audits
+#
+# Standard CI/CD workflow for Coolify-deployed projects.
+# Copy to: .github/workflows/ci-cd.yml
+#
+# What this does:
+#   - On PR to develop or main: lint, typecheck, test (CI only)
+#   - On push to main: CI + version check + git tag + GitHub Release
+#
+# What this does NOT do (Coolify handles these):
+#   - Docker build/push
+#   - SSH deploy
+#   - GHCR image management
+#   - TLS/SSL certificate provisioning
+#   - Health checks and rollback
+#
+# Standards compliance:
+#   - VER-SRC-01: Version read from package.json manifest
+#   - VER-SRC-03: Git tag matches manifest version
+#   - VER-CI-02: CHANGELOG.md entry validated before release
+#   - VER-GH-01: GitHub Release created with changelog content
+#   - VER-CI-04: Changed production deploys must increment version
+#
+# Separation of concerns:
+#   GitHub Actions = CI + release identity
+#   Coolify = deployment (build, deploy, TLS, health, rollback)
+#
+# Customization:
+#   - Replace PROJECT_NAME placeholder if needed
+#   - Remove `npm run typecheck` if not using TypeScript
+#   - For pnpm: replace `npm ci` with `pnpm install --frozen-lockfile`
+#   - For non-Node.js projects: see version-reading alternatives below
+
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: write # Required for creating tags and GitHub Releases
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # CI: Runs on every PR and push to main
+  # ─────────────────────────────────────────────────────────────
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      # Remove this step if project does not use TypeScript
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+  # ─────────────────────────────────────────────────────────────
+  # Release: Only on push to main (after CI passes)
+  # Creates a git tag and GitHub Release if version was bumped.
+  # If version was NOT bumped (tag already exists), skips silently.
+  # This allows infrastructure-only changes (Dockerfile, env vars)
+  # to flow through without forcing a version bump when the
+  # product artifact is unchanged (VER-SEM-04 exception).
+  # ─────────────────────────────────────────────────────────────
+  release:
+    name: Release
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0 # Full history needed for tag comparison
+
+      # ── Read version from manifest (VER-SRC-01) ──
+      # Node.js: reads from package.json
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      # ── Alternative version readers (uncomment the one you need) ──
+      #
+      # .NET (reads from *.csproj):
+      # - name: Read version
+      #   id: version
+      #   run: |
+      #     VERSION=$(grep -oPm1 '(?<=<Version>)[^<]+' *.csproj)
+      #     echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      #     echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+      #
+      # Python (reads from pyproject.toml):
+      # - name: Read version
+      #   id: version
+      #   run: |
+      #     VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+      #     echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      #     echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      # ── Check if this version is already released ──
+      - name: Check existing tag
+        id: tag_check
+        run: |
+          if git tag -l "${{ steps.version.outputs.tag }}" | grep -q .; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${{ steps.version.outputs.tag }} already exists — skipping release"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${{ steps.version.outputs.tag }} is new — will create release"
+          fi
+
+      # ── Validate CHANGELOG.md has entry for this version (VER-CI-02) ──
+      - name: Validate changelog
+        if: steps.tag_check.outputs.exists == 'false'
+        run: |
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::error::CHANGELOG.md not found. Required by VER-LOG-01."
+            exit 1
+          fi
+
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Look for a heading like: ## [1.2.3] or ## 1.2.3 or ## v1.2.3
+          if ! grep -qE "^## \[?v?${VERSION}\]?" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no entry for version ${VERSION}. Add a section: ## [${VERSION}] - $(date +%Y-%m-%d)"
+            exit 1
+          fi
+
+          echo "CHANGELOG.md contains entry for version ${VERSION}"
+
+      # ── Extract changelog section for this version ──
+      - name: Extract changelog
+        if: steps.tag_check.outputs.exists == 'false'
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Extract content between this version's heading and the next ## heading
+          # Handles: ## [1.2.3], ## 1.2.3, ## v1.2.3, with optional date suffix
+          NOTES=$(awk "/^## \[?v?${VERSION}\]?/{found=1; next} /^## /{if(found) exit} found{print}" CHANGELOG.md)
+
+          if [ -z "$NOTES" ]; then
+            NOTES="Release ${VERSION}"
+          fi
+
+          # Write to file to avoid shell escaping issues
+          echo "$NOTES" > /tmp/release-notes.md
+          echo "Release notes extracted ($(wc -l < /tmp/release-notes.md) lines)"
+
+      # ── Create tag (VER-SRC-03) ──
+      - name: Create tag
+        if: steps.tag_check.outputs.exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.version }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      # ── Create GitHub Release (VER-GH-01) ──
+      - name: Create GitHub Release
+        if: steps.tag_check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --notes-file /tmp/release-notes.md
+          echo "GitHub Release created: ${{ steps.version.outputs.tag }}"

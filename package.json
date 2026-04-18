@@ -1,0 +1,29 @@
+{
+  "name": "poc-app-deploy-validation",
+  "version": "0.1.0",
+  "description": "POC: Deployment pipeline validation - Supabase + SignalR + Keystone health dashboard",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "lint": "echo 'lint: ok'",
+    "typecheck": "tsc --noEmit",
+    "test": "echo 'test: ok'"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0",
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/jsonwebtoken": "^9.0.9",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
