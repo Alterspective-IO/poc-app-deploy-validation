@@ -1,6 +1,6 @@
 {
   "name": "poc-app-deploy-validation",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "POC: Deployment pipeline validation - Supabase + SignalR + Keystone health dashboard",
   "main": "dist/index.js",
   "scripts": {
