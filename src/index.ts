@@ -9,7 +9,7 @@ const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const RAW_ENV = process.env.APP_ENV || "local";
 const VERSION = process.env.APP_VERSION || process.env.npm_package_version || require("../package.json").version;
-const BUILD_SHA = process.env.APP_BUILD_SHA || "local";
+const BUILD_SHA = process.env.APP_BUILD_SHA || process.env.SOURCE_COMMIT?.slice(0, 7) || "local";
 const BUILD_DATE = process.env.APP_BUILD_DATE || new Date().toISOString();
 const REPO_URL = "https://github.com/Alterspective-IO/poc-app-deploy-validation";
 
